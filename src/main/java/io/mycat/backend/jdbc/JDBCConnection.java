@@ -347,7 +347,11 @@ public class JDBCConnection implements BackendConnection {
                     //ShowVariables.justReturnValue(sc,String.valueOf(sc.getId()));
                     ShowVariables.justReturnValue(sc, String.valueOf(sc.getId()), this);
                 } else {
-                    ouputResultSet(sc, orgin);
+                    if (ServerPrepareHandler.getAtomicPrepare().compareAndSet(true, false)) {
+                        ouputResultSetPrepared(sc, orgin);
+                    } else {
+                        ouputResultSet(sc, orgin);
+                    }
                 }
             } else {
                 executeddl(sc, orgin);
@@ -655,24 +659,121 @@ public class JDBCConnection implements BackendConnection {
         }
     }
 
+    private void ouputResultSetPrepared(ServerConnection sc, String sql) {
+        ResultSet rs = null;
+        PreparedStatement stmt = null;
+
+        try {
+            stmt = con.prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+            stmt.setFetchSize(Integer.MIN_VALUE);
+
+            rs = stmt.executeQuery();
+
+            while (rs.next()) {
+                List<FieldPacket> fieldPks = new LinkedList<FieldPacket>();
+                ResultSetUtil.resultSetToFieldPacket(sc.getCharset(), fieldPks, rs,
+                        this.isSpark);
+                int colunmCount = fieldPks.size();
+                ByteBuffer byteBuf = sc.allocate();
+                ResultSetHeaderPacket headerPkg = new ResultSetHeaderPacket();
+                headerPkg.fieldCount = fieldPks.size();
+                headerPkg.packetId = ++packetId;
+
+                byteBuf = headerPkg.write(byteBuf, sc, true);
+                byteBuf.flip();
+                byte[] header = new byte[byteBuf.limit()];
+                byteBuf.get(header);
+                byteBuf.clear();
+                List<byte[]> fields = new ArrayList<byte[]>(fieldPks.size());
+                Iterator<FieldPacket> itor = fieldPks.iterator();
+                while (itor.hasNext()) {
+                    FieldPacket curField = itor.next();
+                    curField.packetId = ++packetId;
+                    byteBuf = curField.write(byteBuf, sc, false);
+                    byteBuf.flip();
+                    byte[] field = new byte[byteBuf.limit()];
+                    byteBuf.get(field);
+                    byteBuf.clear();
+                    fields.add(field);
+                }
+                EOFPacket eofPckg = new EOFPacket();
+                eofPckg.packetId = ++packetId;
+                byteBuf = eofPckg.write(byteBuf, sc, false);
+                byteBuf.flip();
+                byte[] eof = new byte[byteBuf.limit()];
+                byteBuf.get(eof);
+                byteBuf.clear();
+                this.respHandler.fieldEofResponse(header, fields, eof, this);
+
+                // output row
+                RowDataPacket curRow = new RowDataPacket(colunmCount);
+                for (int i = 0; i < colunmCount; i++) {
+                    int j = i + 1;
+                    if (MysqlDefs.isBianry((byte) fieldPks.get(i).type)) {
+                        curRow.add(rs.getBytes(j));
+                    } else if (fieldPks.get(i).type == MysqlDefs.FIELD_TYPE_DECIMAL ||
+                            fieldPks.get(i).type == (MysqlDefs.FIELD_TYPE_NEW_DECIMAL - 256)) { // field type is unsigned byte
+                        // ensure that do not use scientific notation format
+                        BigDecimal val = rs.getBigDecimal(j);
+                        curRow.add(StringUtil.encode(val != null ? val.toPlainString() : null,
+                                sc.getCharset()));
+                    } else {
+                        curRow.add(StringUtil.encode(rs.getString(j),
+                                sc.getCharset()));
+                    }
+
+                }
+                curRow.packetId = ++packetId;
+                byteBuf = curRow.write(byteBuf, sc, false);
+                byteBuf.flip();
+                byte[] row = new byte[byteBuf.limit()];
+                byteBuf.get(row);
+                byteBuf.clear();
+                this.respHandler.rowResponse(row, this);
+
+                fieldPks.clear();
+
+                // end row
+                eofPckg = new EOFPacket();
+                eofPckg.packetId = ++packetId;
+                byteBuf = eofPckg.write(byteBuf, sc, false);
+                byteBuf.flip();
+                eof = new byte[byteBuf.limit()];
+                byteBuf.get(eof);
+                sc.recycle(byteBuf);
+                this.respHandler.rowEofResponse(eof, this);
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+        } finally {
+            if (rs != null) {
+                try {
+                    rs.close();
+                } catch (SQLException e) {
+
+                }
+            }
+            if (stmt != null) {
+                try {
+                    stmt.close();
+                } catch (SQLException e) {
+
+                }
+            }
+        }
+    }
+
     private void ouputResultSet(ServerConnection sc, String sql)
             throws SQLException {
         ResultSet rs = null;
         Statement stmt = null;
 
         try {
-            if (ServerPrepareHandler.getAtomicPrepare().compareAndSet(true,false)) {
-                stmt = con.prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-                stmt.setFetchSize(Integer.MIN_VALUE);
-
-                rs = ((PreparedStatement) stmt).executeQuery();
-            } else {
-                stmt = con.createStatement();
-                if (sc.getSqlSelectLimit() > 0) {
-                    stmt.setMaxRows(sc.getSqlSelectLimit());
-                }
-                rs = stmt.executeQuery(sql);
+            stmt = con.createStatement();
+            if (sc.getSqlSelectLimit() > 0) {
+                stmt.setMaxRows(sc.getSqlSelectLimit());
             }
+            rs = stmt.executeQuery(sql);
 
             List<FieldPacket> fieldPks = new LinkedList<FieldPacket>();
             ResultSetUtil.resultSetToFieldPacket(sc.getCharset(), fieldPks, rs,
